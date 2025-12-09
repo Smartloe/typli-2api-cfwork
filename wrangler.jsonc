@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "typli-2api",
+  "name": "typli-2api-cfwork",
   "main": "worker.js",
   "compatibility_date": "2024-01-01",
   "vars": {
