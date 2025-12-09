@@ -1,7 +1,7 @@
 /**
  * =================================================================================
  * 项目: typli-2api (Cloudflare Worker 单文件版)
- * 版本: 2.2.0 (代号: Chimera Vision - TrueStream Adapter)
+ * 版本: 2.3.0 (代号: Chimera Vision - TrueStream Adapter Pro)
  * 作者: 首席AI执行官 (Principal AI Executive Officer)
  * 协议: 奇美拉协议 · 综合版 (Project Chimera: Synthesis Edition)
  * 日期: 2025-12-09
@@ -12,6 +12,9 @@
  * 3. [协议转换] 将 Typli 的自定义 SSE 格式与图片生成接口完美转换为 OpenAI 兼容格式。
  * 4. [开发者驾驶舱] 内置全功能中文调试界面，支持聊天与文生图的实时测试与日志监控。
  * 5. [通用流式适配] 所有响应均以流式（SSE）格式返回，完美兼容各类聊天客户端。
+ * 6. [智能上下文] 自动管理对话上下文长度，保留系统提示词和最近消息。
+ * 7. [自动重试] 请求失败时自动重试，提高服务稳定性。
+ * 8. [超时控制] 防止请求卡死，确保及时响应。
  * =================================================================================
  */
 
@@ -19,10 +22,25 @@
 const CONFIG = {
   // 项目元数据
   PROJECT_NAME: "typli-2api",
-  PROJECT_VERSION: "2.2.0",
+  PROJECT_VERSION: "2.3.0",
 
   // 安全配置 (建议在 Cloudflare 环境变量中设置 API_MASTER_KEY)
   API_MASTER_KEY: "1",
+
+  // === 新增：上下文管理配置 ===
+  MAX_CONTEXT_TOKENS: 8000,      // 最大上下文 token 数（估算值）
+  MAX_MESSAGES: 20,              // 最大保留消息数
+  ALWAYS_KEEP_SYSTEM: true,      // 始终保留 system prompt
+  CHARS_PER_TOKEN: 4,            // 中英文混合估算：约4字符=1token
+
+  // === 新增：重试配置 ===
+  MAX_RETRIES: 3,                // 最大重试次数
+  RETRY_DELAY_MS: 1000,          // 重试间隔（毫秒）
+  RETRY_BACKOFF: 1.5,            // 重试退避倍数
+
+  // === 新增：超时配置 ===
+  REQUEST_TIMEOUT_MS: 60000,     // 请求超时时间（60秒）
+  STREAM_TIMEOUT_MS: 30000,      // 流式响应超时（30秒无数据）
 
   // 上游服务配置
   UPSTREAM_CHAT_URL: "https://typli.ai/api/generators/chat",
@@ -180,7 +198,8 @@ async function handleChatCompletions(request, requestId) {
           // --- 图片模型逻辑：获取URL并作为单个流式块发送 ---
           const payload = { prompt, model };
           const headers = { ...CONFIG.BASE_HEADERS, "referer": CONFIG.REFERER_IMAGE_URL };
-          const response = await fetch(CONFIG.UPSTREAM_IMAGE_URL, {
+          // 使用带重试的 fetch
+          const response = await fetchWithRetry(CONFIG.UPSTREAM_IMAGE_URL, {
             method: "POST",
             headers: headers,
             body: JSON.stringify(payload)
@@ -206,7 +225,18 @@ async function handleChatCompletions(request, requestId) {
         } else {
           // --- 聊天模型逻辑：代理上游流式响应 ---
           const sessionId = generateRandomId(16);
-          const typliMessages = (body.messages || []).map(msg => ({
+          
+          // 智能截断消息，确保不超过上下文限制
+          const truncatedMessages = truncateMessages(body.messages || []);
+          const originalCount = (body.messages || []).length;
+          const truncatedCount = truncatedMessages.length;
+          
+          // 如果消息被截断，在日志中记录
+          if (truncatedCount < originalCount) {
+            console.log(`[Context] 消息截断: ${originalCount} -> ${truncatedCount}, 估算tokens: ${estimateMessagesTokens(truncatedMessages)}`);
+          }
+          
+          const typliMessages = truncatedMessages.map(msg => ({
             parts: [{ type: "text", text: msg.content }],
             id: generateRandomId(16),
             role: msg.role
@@ -221,7 +251,8 @@ async function handleChatCompletions(request, requestId) {
           };
 
           const headers = { ...CONFIG.BASE_HEADERS, "referer": CONFIG.REFERER_CHAT_URL };
-          const response = await fetch(CONFIG.UPSTREAM_CHAT_URL, {
+          // 使用带重试的 fetch
+          const response = await fetchWithRetry(CONFIG.UPSTREAM_CHAT_URL, {
             method: "POST",
             headers: headers,
             body: JSON.stringify(payload)
@@ -288,6 +319,109 @@ async function handleChatCompletions(request, requestId) {
 }
 
 // --- [第四部分: 辅助函数] ---
+
+// === 新增：Token 估算函数 ===
+function estimateTokens(text) {
+  if (!text) return 0;
+  // 中英文混合估算：中文约1.5字符=1token，英文约4字符=1token
+  // 简化为统一使用 CONFIG.CHARS_PER_TOKEN
+  return Math.ceil(text.length / CONFIG.CHARS_PER_TOKEN);
+}
+
+// === 新增：计算消息列表的总 token 数 ===
+function estimateMessagesTokens(messages) {
+  return messages.reduce((total, msg) => {
+    const content = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+    return total + estimateTokens(content) + 4; // 每条消息额外开销约4 tokens
+  }, 0);
+}
+
+// === 新增：智能消息截断函数 ===
+function truncateMessages(messages, maxTokens = CONFIG.MAX_CONTEXT_TOKENS, maxMessages = CONFIG.MAX_MESSAGES) {
+  if (!messages || messages.length === 0) return [];
+  
+  // 分离 system 消息和其他消息
+  const systemMessages = CONFIG.ALWAYS_KEEP_SYSTEM 
+    ? messages.filter(m => m.role === 'system')
+    : [];
+  const otherMessages = CONFIG.ALWAYS_KEEP_SYSTEM
+    ? messages.filter(m => m.role !== 'system')
+    : [...messages];
+  
+  // 计算 system 消息占用的 tokens
+  const systemTokens = estimateMessagesTokens(systemMessages);
+  const remainingTokens = maxTokens - systemTokens;
+  
+  // 从最新的消息开始保留，直到达到限制
+  const result = [];
+  let currentTokens = 0;
+  
+  // 从后往前遍历，保留最近的消息
+  for (let i = otherMessages.length - 1; i >= 0 && result.length < maxMessages; i--) {
+    const msg = otherMessages[i];
+    const msgTokens = estimateTokens(msg.content) + 4;
+    
+    if (currentTokens + msgTokens <= remainingTokens) {
+      result.unshift(msg);
+      currentTokens += msgTokens;
+    } else {
+      break; // 超出 token 限制，停止添加
+    }
+  }
+  
+  // 合并 system 消息和截断后的消息
+  return [...systemMessages, ...result];
+}
+
+// === 新增：带超时的 fetch ===
+async function fetchWithTimeout(url, options, timeoutMs = CONFIG.REQUEST_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+    return response;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+// === 新增：带重试的 fetch ===
+async function fetchWithRetry(url, options, maxRetries = CONFIG.MAX_RETRIES) {
+  let lastError;
+  let delay = CONFIG.RETRY_DELAY_MS;
+  
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const response = await fetchWithTimeout(url, options);
+      
+      // 如果是服务器错误 (5xx)，可以重试
+      if (response.status >= 500 && attempt < maxRetries) {
+        throw new Error(`Server error: ${response.status}`);
+      }
+      
+      return response;
+    } catch (error) {
+      lastError = error;
+      
+      // 如果是中止错误（超时），直接抛出
+      if (error.name === 'AbortError') {
+        throw new Error(`请求超时 (${CONFIG.REQUEST_TIMEOUT_MS / 1000}秒)`);
+      }
+      
+      // 如果还有重试次数，等待后重试
+      if (attempt < maxRetries) {
+        await new Promise(resolve => setTimeout(resolve, delay));
+        delay *= CONFIG.RETRY_BACKOFF; // 指数退避
+      }
+    }
+  }
+  
+  throw lastError;
+}
 
 function generateRandomId(length) {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';

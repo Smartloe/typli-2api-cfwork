@@ -1,0 +1,19 @@
+{
+  "name": "typli-2api-cfwork",
+  "version": "2.2.0",
+  "description": "Typli.ai to OpenAI API proxy - Cloudflare Worker",
+  "main": "worker.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^3.99.0"
+  },
+  "keywords": [
+    "cloudflare-worker",
+    "openai-api",
+    "proxy"
+  ],
+  "license": "Apache-2.0"
+}
